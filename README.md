@@ -23,6 +23,7 @@ emulator for a real instrument means changing the transport, not the driver.
   worse than an honest error row.
 - `lablink/api.py` - FastAPI: `/api/instrument`, `/api/latest`, `/api/history/{ch}`,
   `/api/alarms`, `/api/setpoint/{ch}`, plus a small live dashboard at `/`.
+  Setpoint writes reach the instrument, so they require a bearer token.
 - `dashboard/index.html` - dependency-free status page.
 
 ## run it
@@ -32,6 +33,18 @@ pip install -e .
 python -m lablink.demo          # emulator on :5025, API+dashboard on :8000
 # open http://127.0.0.1:8000
 ```
+
+The demo prints a bearer token at startup. Setpoint writes need it:
+
+```bash
+curl -X POST -H 'Authorization: Bearer <token>' 'http://127.0.0.1:8000/api/setpoint/TEMP?value=37.5'
+```
+
+Read endpoints stay open. Set `LABLINK_API_TOKEN` to use your own token, or
+`LABLINK_ALLOWED_ORIGINS` (comma-separated) to permit extra browser origins.
+Requests carrying an `Origin` header that does not match the server's host are
+rejected, and without a token configured `create_app` refuses writes unless it
+is built with `allow_insecure_writes=True`, which is only safe on loopback.
 
 Inject a fault while it runs:
 
@@ -47,12 +60,19 @@ printf 'SIM:FAULT NONE\n' | nc 127.0.0.1 5025   # driver reconnects on its own
 | `*IDN?` | `LABLINK,THRIVE-1000,BIOREACTOR,1.4.2` | identity |
 | `MEAS:TEMP?` | `36.982` | measure a channel (TEMP, PH, DO, AGIT, WEIGHT) |
 | `CONF:TEMP 37.5` | `OK` | move a setpoint |
-| `SYST:ERR?` | `0,"No error"` | pop the error register |
+| `SYST:ERR?` | `0,"No error"` | pop the error register (destructive read) |
 | `STAT?` | `RUNNING` | run state |
 | `RUN` / `STOP` | `OK` | start/stop the process |
 | `SIM:FAULT <mode>` | `OK` | test-only fault injection |
 
 Errors are returned as `-<code>,"<message>"` and surface as `InstrumentError`.
+
+The driver retries idempotent commands after a transport failure, since a lost
+reply can mean the command ran twice anyway. `SYST:ERR?` is different: a
+successful read consumes the register, so if its reply is lost the driver
+raises `TransportError` instead of retrying into a cleared register. Non-finite
+readings (`nan`, `inf`) are rejected at the driver and stored as device-error
+rows, never as valid data.
 
 ## tests
 
@@ -61,9 +81,11 @@ pip install -e .[dev]
 python -m pytest tests/
 ```
 
-15 tests cover protocol round-trips, setpoint validation, measurement drift, link-drop
-reconnect, negative-value parsing, concurrent transaction safety, error-register reads, error-row persistence,
-alarm firing, and the API surface.
+27 tests cover protocol round-trips, setpoint validation, measurement drift, link-drop
+reconnect, negative-value parsing, concurrent transaction safety, error-register reads
+(including the no-retry-on-lost-reply rule), non-finite rejection, setpoint
+authentication and origin checks, error-row persistence, alarm firing, shutdown
+ordering, and the API surface.
 
 ## honest scope
 

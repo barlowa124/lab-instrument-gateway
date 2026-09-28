@@ -1,11 +1,15 @@
 """FastAPI surface over the capture service plus a minimal live dashboard."""
 from __future__ import annotations
 
+import math
+import os
+import secrets
 from pathlib import Path
+from urllib.parse import urlparse
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 
 from .capture import CaptureService
@@ -14,8 +18,24 @@ from .protocol import CHANNELS
 
 DASHBOARD = Path(__file__).resolve().parent.parent / "dashboard" / "index.html"
 
+API_TOKEN_ENV = "LABLINK_API_TOKEN"
+ALLOWED_ORIGINS_ENV = "LABLINK_ALLOWED_ORIGINS"
 
-def create_app(client: InstrumentClient, db_path: str) -> FastAPI:
+
+def create_app(client: InstrumentClient, db_path: str, api_token: str | None = None,
+               allow_insecure_writes: bool = False) -> FastAPI:
+    """Build the API app.
+
+    Setpoint writes reach the instrument, so they are gated. With an
+    ``api_token`` (or ``LABLINK_API_TOKEN``) callers must send a bearer token
+    in the Authorization header. Without a token, writes are refused
+    unless ``allow_insecure_writes=True``, which is only safe on a loopback
+    bind. Requests carrying a foreign ``Origin`` header are always rejected.
+    """
+    token = api_token if api_token is not None else os.environ.get(API_TOKEN_ENV)
+    allowed_origins = {
+        o.strip() for o in os.environ.get(ALLOWED_ORIGINS_ENV, "").split(",") if o.strip()
+    }
     svc = CaptureService(client, db_path)
 
     @asynccontextmanager
@@ -69,11 +89,30 @@ def create_app(client: InstrumentClient, db_path: str) -> FastAPI:
     def stats():
         return svc.stats
 
+    def _check_write(request: Request):
+        origin = request.headers.get("origin")
+        if origin is not None:
+            origin_host = urlparse(origin).netloc
+            if origin_host != request.headers.get("host") and origin not in allowed_origins:
+                raise HTTPException(403, "cross-origin writes are not allowed")
+        if token is None:
+            if not allow_insecure_writes:
+                raise HTTPException(
+                    403, f"setpoint writes disabled. Set {API_TOKEN_ENV} or "
+                    f"pass allow_insecure_writes=True for loopback-only use")
+            return
+        auth = request.headers.get("authorization", "")
+        if not secrets.compare_digest(auth, f"Bearer {token}"):
+            raise HTTPException(401, "missing or invalid bearer token")
+
     @app.post("/api/setpoint/{channel}")
-    def setpoint(channel: str, value: float):
+    def setpoint(request: Request, channel: str, value: float):
+        _check_write(request)
         channel = channel.upper()
         if channel not in CHANNELS:
             raise HTTPException(404, f"unknown channel {channel}")
+        if not math.isfinite(value):
+            raise HTTPException(422, "setpoint must be finite")
         try:
             client.set_setpoint(channel, value)
         except InstrumentError as e:

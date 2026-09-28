@@ -95,6 +95,67 @@ def test_fault_sets_error_register_once(device):
         assert c.error_register() == '0,"No error"'
 
 
+def test_nonfinite_readings_are_errors(device):
+    host, port, _ = device
+    with InstrumentClient(host, port) as c:
+        for bad in ("nan", "inf", "-inf"):
+            c.query = lambda line, bad=bad: bad
+            with pytest.raises(InstrumentError):
+                c.measure("TEMP")
+
+
+def test_setpoint_rejects_nonfinite(device):
+    host, port, srv = device
+    with InstrumentClient(host, port) as c:
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            with pytest.raises(InstrumentError):
+                c.set_setpoint("TEMP", bad)
+        assert srv.device.setpoints["TEMP"] == pytest.approx(37.0)
+
+
+def test_error_register_not_retried_after_lost_reply(device):
+    """SYST:ERR? pops the register. A lost reply must not trigger a retry
+    that returns the cleared register."""
+    host, port, _ = device
+    with InstrumentClient(host, port) as c:
+        calls = {"send": 0, "read": 0}
+
+        def fake_send(line):
+            calls["send"] += 1
+
+        def fake_read():
+            calls["read"] += 1
+            raise TransportError("reply lost")
+
+        c._send_line = fake_send
+        c._readline = fake_read
+        with pytest.raises(TransportError):
+            c.error_register()
+        assert calls == {"send": 1, "read": 1}
+
+
+def test_send_failure_still_retries_destructive_query(device):
+    """If the send itself failed the device never saw SYST:ERR?, so retrying
+    is safe."""
+    host, port, _ = device
+    with InstrumentClient(host, port) as c:
+        sends = []
+
+        def flaky_send(line):
+            sends.append(line)
+            if len(sends) == 1:
+                raise TransportError("write failed")
+
+        def fake_read():
+            return '0,"No error"'
+
+        c._send_line = flaky_send
+        c._readline = fake_read
+        c.connect = lambda: None
+        assert c.error_register() == '0,"No error"'
+        assert len(sends) == 2
+
+
 def test_concurrent_transactions_do_not_desync(device):
     """Poll + setpoint from two threads must not cross-response."""
     import threading

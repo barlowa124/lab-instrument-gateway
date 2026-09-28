@@ -74,12 +74,15 @@ class CaptureService:
         self._db.commit()
         self._lock = threading.Lock()
         self._stop = threading.Event()
+        self._closed = False
         self._thread: threading.Thread | None = None
         self.stats = {"polled": 0, "ok": 0, "transport_error": 0, "device_error": 0, "alarms": 0}
 
     def poll_once(self) -> list[ReadingRow]:
         rows: list[ReadingRow] = []
         for ch in self.channels:
+            if self._stop.is_set():
+                break
             self.stats["polled"] += 1
             try:
                 r = self.client.measure(ch)
@@ -149,6 +152,11 @@ class CaptureService:
 
     def stop(self):
         self._stop.set()
+        # the worker is always bounded: every socket op has a timeout and the
+        # retry count is finite, so joining without a timeout cannot hang
         if self._thread:
-            self._thread.join(timeout=5)
-        self._db.close()
+            self._thread.join()
+            self._thread = None
+        if not self._closed:
+            self._db.close()
+            self._closed = True

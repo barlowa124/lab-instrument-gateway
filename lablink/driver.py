@@ -7,6 +7,7 @@ object is the only emulator-specific piece.
 """
 from __future__ import annotations
 
+import math
 import socket
 import threading
 import time
@@ -18,6 +19,11 @@ READ_TIMEOUT_S = 2.0
 QUERY_RETRIES = 3
 RECONNECT_BACKOFF_S = 0.05
 MAX_LINE_BYTES = 65536
+
+# Queries that consume device state when they succeed. SYST:ERR? pops the
+# error register, so retrying after a lost reply would read the cleared
+# register and silently swallow the fault.
+DESTRUCTIVE_QUERIES = frozenset({"SYST:ERR?"})
 
 
 class InstrumentError(Exception):
@@ -109,18 +115,28 @@ class InstrumentClient:
         """Send a query and return the response line, reconnecting on failure.
 
         A timed-out command may have been processed before the reply was lost,
-        so a retry can execute it twice. Every command in the wire protocol
-        (setpoints, RUN/STOP, fault injection) is idempotent, which is what
-        makes this retry policy safe.
+        so a retry can execute it twice. That is safe for the idempotent
+        commands in this protocol (setpoints, RUN/STOP, fault injection, plain
+        reads) but not for DESTRUCTIVE_QUERIES: if a SYST:ERR? reply is lost,
+        the register was already popped and a retry would return the cleared
+        value. Destructive queries get one attempt once the line has been sent.
         """
+        destructive = line.strip().upper() in DESTRUCTIVE_QUERIES
         last_err: Exception | None = None
         with self._tx:
             for attempt in range(QUERY_RETRIES):
+                sent = False
                 try:
                     self._send_line(line)
+                    sent = True
                     return self._readline()
                 except TransportError as e:
                     last_err = e
+                    if sent and destructive:
+                        raise TransportError(
+                            f"reply to {line!r} was lost and device state may "
+                            f"already be consumed ({e})"
+                        ) from e
                     time.sleep(RECONNECT_BACKOFF_S)
                     try:
                         self.connect()
@@ -145,11 +161,16 @@ class InstrumentClient:
         try:
             # a reading can legitimately be negative; only unparseable
             # responses (which include the device's error strings) are errors
-            return Reading(channel=channel, value=float(raw), raw=raw)
+            value = float(raw)
         except ValueError as e:
             raise InstrumentError(f"measurement for {channel}: {raw!r}") from e
+        if not math.isfinite(value):
+            raise InstrumentError(f"non-finite reading for {channel}: {raw!r}")
+        return Reading(channel=channel, value=value, raw=raw)
 
     def set_setpoint(self, channel: str, value: float):
+        if not math.isfinite(value):
+            raise InstrumentError(f"non-finite setpoint for {channel}: {value!r}")
         resp = self.command(f"CONF:{channel} {value}")
         if resp != "OK":
             raise InstrumentError(resp)
