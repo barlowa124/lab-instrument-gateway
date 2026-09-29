@@ -1,3 +1,7 @@
+> **This repository has moved.** Active development continues in [barlowa124/lab-informatics](https://github.com/barlowa124/lab-informatics) under [`lab_instrument_gateway/`](https://github.com/barlowa124/lab-informatics/tree/main/lab_instrument_gateway). This repo is archived and kept for link stability.
+
+---
+
 # lablink - instrument gateway
 
 Software that talks to a lab instrument, captures its readings, and serves them over an API.
